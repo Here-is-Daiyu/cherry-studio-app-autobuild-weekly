@@ -1,0 +1,129 @@
+name: Android CI Build & Upstream Merge
+
+on:
+  schedule:
+    # 每周一凌晨2点触发（UTC时间）。你可以根据需要调整这个 cron 表达式。
+    - cron: '0 0 * * MON'
+  workflow_dispatch: # 允许手动从GitHub UI触发此工作流
+
+env:
+  NODE_VERSION: '18' # 统一管理Node.js版本
+  JAVA_VERSION: '17' # 统一管理Java版本
+  UPSTREAM_REPO: 'https://github.com/CherryHQ/cherry-studio-app.git' # 统一管理上游仓库URL
+
+jobs:
+  merge_upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      merged_changes: ${{ steps.rebase_step.outputs.merged_status }} # 将 rebase_step 的输出作为 job 的输出
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0 # 获取完整历史，对rebase更稳健
+
+      - name: Configure Git User
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add/Update Upstream Remote
+        run: |
+          # 确保如果remote已经存在，不会报错，而是更新其URL
+          git remote add upstream ${{ env.UPSTREAM_REPO }} || git remote set-url upstream ${{ env.UPSTREAM_REPO }}
+
+      - name: Fetch Upstream Changes
+        run: git fetch upstream
+
+      - name: Rebase Upstream into Main Branch
+        id: rebase_step # 步骤ID更具描述性
+        run: |
+          git checkout main
+          git config pull.rebase true # 设置pull默认使用rebase策略
+
+          set +e # 临时禁用bash的errexit，以便我们可以检查git pull的返回值
+          git pull upstream main --autostash
+          PULL_STATUS=$?
+          set -e # 重新启用errexit
+
+          if [ $PULL_STATUS -eq 0 ]; then
+            echo "Pull successful, checking if main branch was updated..."
+            LOCAL_MAIN_SHA=$(git rev-parse HEAD)
+            UPSTREAM_MAIN_SHA=$(git rev-parse upstream/main)
+
+            if [ "$LOCAL_MAIN_SHA" != "$UPSTREAM_MAIN_SHA" ]; then
+                echo "Repository updated after rebase."
+                echo "merged_status=true" >> $GITHUB_OUTPUT # 使用环境变量文件设置步骤输出
+            else
+                echo "No new commits from upstream, or fast-forwarded without new content."
+                echo "merged_status=false" >> $GITHUB_OUTPUT # 使用环境变量文件设置步骤输出
+            fi
+          else
+            echo "##[error]Failed to pull and rebase upstream/main into main. Manual intervention may be required."
+            echo "merged_status=false" >> $GITHUB_OUTPUT # 即使失败也要设置输出，以便后续步骤可以判断
+            exit 1 # Rebase失败时直接终止任务
+          fi
+
+      - name: Push Rebased Changes to Main
+        if: steps.rebase_step.outputs.merged_status == 'true' # 只有当有实际合并发生时才推送
+        run: |
+            git push origin main --force-with-lease # 使用 --force-with-lease 避免覆盖其他人的并行更新
+            echo "Successfully pushed rebased changes to main."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build_android:
+    needs: merge_upstream # 确保在合并上游仓库之后才进行构建
+    runs-on: ubuntu-latest
+    # 只有当 merge_upstream Job 成功且有实际合并发生时才运行此 Job
+    if: needs.merge_upstream.outputs.merged_changes == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }} # 使用环境变量
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install JavaScript Dependencies
+        run: yarn install
+
+      - name: Generate Database Schema
+        run: npx drizzle-kit generate
+
+      - name: Install Expo CLI
+        run: npm install -g expo-cli
+
+      - name: Generate Android Native Project Files
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Setup Java for Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }} # 使用环境变量
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      # 移除了 "Add Gradle Mirror Repositories (Optional)" 步骤，
+      # 因为它只是一个 echo 提示，没有实际操作，且建议在项目内配置。
+      # 如果需要，可以重新添加，但为了简洁，暂时移除。
+
+      - name: Build Android Release APK
+        run: ./gradlew assembleRelease
+        working-directory: ./android
+
+      - name: Upload Android Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-apk
+          path: ./android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 42 # 根据需要调整
